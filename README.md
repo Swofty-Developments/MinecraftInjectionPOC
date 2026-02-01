@@ -24,17 +24,7 @@ Here's most detection methods these tools commonly use, and why none of them wor
 
 **Running `jmap -histo` to look for suspicious classes?** The agent classes live in an isolated `URLClassLoader` with `parent=null`. When self-destruct fires, the classloader is closed, all references are nulled, and the GC collects every class it loaded. They're just gone.
 
-This works because we split things into two JARs:
-
-```
-bootstrap.jar (minimal, on bootstrap classloader):
-  Agent.class, AgentBootstrap.class, HookRegistry.class
-
-agent.jar (loaded by our custom URLClassLoader):
-  Everything above + OverlayTransformer, TransformerCoordinator, DestructHandler, ASM
-```
-
-Only `bootstrap.jar` goes on the bootstrap classloader, and it doesn't contain any of the stealth classes. So when the custom classloader gets GC'd, those classes go with it.
+This works because the agent classes live in an isolated URLClassLoader with parent=null. When self-destruct fires, the classloader is closed, all references are nulled, and the GC collects every class it loaded. Agent, AgentBootstrap, HookRegistry, OverlayTransformer, TransformerCoordinator, DestructHandler, and all ASM classes are fully unloaded. Nothing from the agent remains in the class histogram.
 
 **Comparing in-memory bytecode against the original JAR?** On self-destruct, the transformer re-registers briefly with `isActive=false`, calls `retransformClasses()`, and returns `null` telling the JVM to restore the original bytecode. After that, `avo` is byte-for-byte identical to vanilla.
 
