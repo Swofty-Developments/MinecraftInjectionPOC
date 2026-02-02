@@ -18,27 +18,17 @@ From there, a daemon tick thread runs at ~20 tps, updating the action bar and po
 
 ## Why screenshare tools can't catch it
 
-Here's most detection methods these tools commonly use, and why none of them work:
+There are no JVM arguments to find. No -javaagent, no attach API socket, nothing in /proc/<pid>/cmdline. The JVM was never told to load anything. InstrumentationImpl doesn't exist in the runtime because we never touched the Instrumentation API, so as far as the JVM is concerned, no agent has ever loaded. Running jmap -histo won't help either since the Bootstrap class lives in an isolated URLClassLoader, and on unload every reference gets nulled, the classloader is closed, and GC cleans up the rest. The class just isn't on the heap anymore.                                                                       
 
-**Checking JVM arguments?** There are none. No `-javaagent`, no attach API socket, nothing in `/proc/<pid>/cmdline`.
+Checking /proc/<pid>/maps for suspicious .so files comes up empty too. On unload, the payload builds x86_64 shellcode on an anonymous memory page that munmaps every region belonging to payload.so, and the .so is gone from process maps entirely. We can't use dlclose for this since glibc corrupts its own TLS state and crashes in _dl_catch_exception, so instead we just rip the pages out directly with raw syscalls. Native methods are explicitly unregistered before any of this happens, so there are no dangling function pointers and nothing pointing into unmapped memory.                                       
 
-**Scanning for `InstrumentationImpl`?** It doesn't exist. We never used the Instrumentation API. The JVM has no record of any agent ever loading.
-
-**Running `jmap -histo`?** The Bootstrap class lives in an isolated `URLClassLoader`. On unload, all references are nulled, the classloader is closed, and the GC collects everything. The class is gone from the heap.
-
-**Checking `/proc/<pid>/maps` for suspicious `.so` files?** On unload, the payload generates x86_64 shellcode on an anonymous memory page that `munmap`s every region belonging to `payload.so`. The `.so` vanishes from the process maps entirely. No `dlclose`, since that would crash due to glibc TLS corruption (as I roughly found out), just raw `munmap` of every mapped region.
-
-**Looking for loaded native libraries via JNI?** The JNI native methods are explicitly unregistered before unload. No dangling function pointers, no registered native methods pointing into unmapped memory.
-
-**Checking for modified bytecode?** We don't modify any bytecode. The rendering is done from Java code defined via JNI into an isolated classloader. Minecraft's own classes are untouched, byte-for-byte identical to vanilla.
+No bytecode is modified at any point. Rendering is done from Java code defined via JNI into an isolated classloader, and Minecraft's own classes are completely untouched, byte-for-byte identical to vanilla.  
 
 ## What's actually left after unload
 
 One thing:
 
 - A small (~4KB) `memfd:x (deleted)` mapping; this is the anonymous executable page used as a trampoline during injection. It contains no identifying information, just generic function-call shellcode. It's indistinguishable from other anonymous mappings that various libraries create.
-
-That's it. No `.so` in the maps, no classes in the heap, no registered transformers, no native methods, no Instrumentation instance, no agent traces. The JVM has no idea anything happened.
 
 ## Building
 
