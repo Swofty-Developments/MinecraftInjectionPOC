@@ -36,7 +36,7 @@ static jclass define_class_in_loader(JNIEnv *env, jobject loader, const char *na
 static int bootstrap_java(void);
 static void *worker_thread(void *arg);
 static void schedule_self_unload(void);
-JNIEXPORT void JNICALL Java_Bootstrap_nativeUnload(JNIEnv *env, jclass cls);
+JNIEXPORT void JNICALL Java_client_Bootstrap_nativeUnload(JNIEnv *env, jclass cls);
 
 /*
  * Find libjvm.so and get JNI_GetCreatedJavaVMs
@@ -342,59 +342,150 @@ static unsigned char* read_class_file(const char *path, size_t *out_len) {
 }
 
 /*
- * Bootstrap the Java code
+ * Load a class file from disk and define it in the isolated classloader.
+ * Searches the given NULL-terminated path list.
+ * Returns the jclass (caller must DeleteLocalRef) or NULL on failure.
  */
-static int bootstrap_java(void) {
-    /*
-     * Option 1: Load class file from disk
-     * Option 2: Embed bytecode directly in this .so
-     *
-     * For now, we'll try to load from a known path, then fall back to
-     * finding a JAR in the same directory as this .so
-     */
-
-    const char *class_paths[] = {
-        "/tmp/Bootstrap.class",
-        "./Bootstrap.class",
-        NULL
-    };
-
+static jclass load_and_define(const char *name, const char **paths) {
     unsigned char *bytecode = NULL;
     size_t bytecode_len = 0;
 
-    for (int i = 0; class_paths[i]; i++) {
-        bytecode = read_class_file(class_paths[i], &bytecode_len);
+    for (int i = 0; paths[i]; i++) {
+        bytecode = read_class_file(paths[i], &bytecode_len);
         if (bytecode) {
-            printf("[payload] Loaded Bootstrap.class from %s\n", class_paths[i]);
+            printf("[payload] Loaded %s.class from %s\n", name, paths[i]);
             break;
         }
     }
 
     if (!bytecode) {
-        fprintf(stderr, "[payload] Could not find Bootstrap.class\n");
-        fprintf(stderr, "[payload] Please place Bootstrap.class in /tmp/ or current directory\n");
-        return -1;
+        fprintf(stderr, "[payload] Could not find %s.class\n", name);
+        return NULL;
     }
 
-    /* Define the class in our isolated loader */
-    g_bootstrap_class = define_class_in_loader(g_env, g_isolated_loader,
-        "Bootstrap", bytecode, bytecode_len);
-
+    jclass cls = define_class_in_loader(g_env, g_isolated_loader,
+        name, bytecode, bytecode_len);
     free(bytecode);
 
-    if (!g_bootstrap_class) {
-        fprintf(stderr, "[payload] Failed to define Bootstrap class\n");
-        return -1;
+    if (!cls) {
+        fprintf(stderr, "[payload] Failed to define %s class\n", name);
+        return NULL;
     }
 
-    printf("[payload] Defined Bootstrap class\n");
+    printf("[payload] Defined %s class\n", name);
+    return cls;
+}
 
-    /* Register native methods - payload.so was loaded via ptrace+dlopen,
-     * not System.loadLibrary, so JVM won't search it for JNI symbols.
-     * We must explicitly register them. */
+/*
+ * Bootstrap the Java code - load all classes in dependency order, then init.
+ */
+static int bootstrap_java(void) {
+    jclass cls;
+
+    /* Class loading order matters: each class must be defined before
+     * any class that references it at the bytecode level. */
+
+    /*
+     * Load classes in dependency order.
+     * Package classes go in /tmp/client/ and /tmp/client/rendering/.
+     * RenderHook stays in default package (/tmp/).
+     */
+
+    /* --- client.rendering package (no cross-deps first) --- */
+
+    const char *simplegui_paths[] = {
+        "/tmp/client/rendering/SimpleGui.class",
+        "./client/rendering/SimpleGui.class", NULL};
+    cls = load_and_define("client.rendering.SimpleGui", simplegui_paths);
+    if (!cls) return -1;
+    (*g_env)->DeleteLocalRef(g_env, cls);
+
+    const char *renderable_paths[] = {
+        "/tmp/client/rendering/Renderable.class",
+        "./client/rendering/Renderable.class", NULL};
+    cls = load_and_define("client.rendering.Renderable", renderable_paths);
+    if (!cls) return -1;
+    (*g_env)->DeleteLocalRef(g_env, cls);
+
+    /* --- client package --- */
+
+    const char *mcrefl_paths[] = {
+        "/tmp/client/McReflection.class",
+        "./client/McReflection.class", NULL};
+    cls = load_and_define("client.McReflection", mcrefl_paths);
+    if (!cls) return -1;
+    (*g_env)->DeleteLocalRef(g_env, cls);
+
+    const char *restore_paths[] = {
+        "/tmp/client/RestoreManager.class",
+        "./client/RestoreManager.class", NULL};
+    cls = load_and_define("client.RestoreManager", restore_paths);
+    if (!cls) return -1;
+    (*g_env)->DeleteLocalRef(g_env, cls);
+
+    const char *restore_action_paths[] = {
+        "/tmp/client/RestoreManager$RestoreAction.class",
+        "./client/RestoreManager$RestoreAction.class", NULL};
+    cls = load_and_define("client.RestoreManager$RestoreAction", restore_action_paths);
+    if (!cls) return -1;
+    (*g_env)->DeleteLocalRef(g_env, cls);
+
+    const char *input_paths[] = {
+        "/tmp/client/InputManager.class",
+        "./client/InputManager.class", NULL};
+    cls = load_and_define("client.InputManager", input_paths);
+    if (!cls) return -1;
+    (*g_env)->DeleteLocalRef(g_env, cls);
+
+    const char *keybind_paths[] = {
+        "/tmp/client/InputManager$Keybind.class",
+        "./client/InputManager$Keybind.class", NULL};
+    cls = load_and_define("client.InputManager$Keybind", keybind_paths);
+    if (!cls) return -1;
+    (*g_env)->DeleteLocalRef(g_env, cls);
+
+    const char *chat_paths[] = {
+        "/tmp/client/ChatUtil.class",
+        "./client/ChatUtil.class", NULL};
+    cls = load_and_define("client.ChatUtil", chat_paths);
+    if (!cls) return -1;
+    (*g_env)->DeleteLocalRef(g_env, cls);
+
+    /* --- client.rendering (depends on client) --- */
+
+    const char *renderhandler_paths[] = {
+        "/tmp/client/rendering/RenderHandler.class",
+        "./client/rendering/RenderHandler.class", NULL};
+    cls = load_and_define("client.rendering.RenderHandler", renderhandler_paths);
+    if (!cls) return -1;
+    (*g_env)->DeleteLocalRef(g_env, cls);
+
+    const char *mainoverlay_paths[] = {
+        "/tmp/client/rendering/MainOverlay.class",
+        "./client/rendering/MainOverlay.class", NULL};
+    cls = load_and_define("client.rendering.MainOverlay", mainoverlay_paths);
+    if (!cls) return -1;
+    (*g_env)->DeleteLocalRef(g_env, cls);
+
+    /* --- RenderHook (default package, extends MC stubs) --- */
+
+    const char *hook_paths[] = {"/tmp/RenderHook.class", "./RenderHook.class", NULL};
+    cls = load_and_define("RenderHook", hook_paths);
+    if (!cls) return -1;
+    (*g_env)->DeleteLocalRef(g_env, cls);
+
+    /* --- client.Bootstrap (references everything) --- */
+
+    const char *boot_paths[] = {
+        "/tmp/client/Bootstrap.class",
+        "./client/Bootstrap.class", NULL};
+    g_bootstrap_class = load_and_define("client.Bootstrap", boot_paths);
+    if (!g_bootstrap_class) return -1;
+
+    /* Register native methods */
     {
         JNINativeMethod methods[] = {
-            {"nativeUnload", "()V", (void *)Java_Bootstrap_nativeUnload}
+            {"nativeUnload", "()V", (void *)Java_client_Bootstrap_nativeUnload}
         };
         jint reg_res = (*g_env)->RegisterNatives(g_env, g_bootstrap_class, methods, 1);
         if (reg_res != JNI_OK) {
@@ -546,8 +637,19 @@ static void *worker_thread(void *arg) {
         return NULL;
     }
 
+    /* Promote g_bootstrap_class from local ref to global ref BEFORE
+     * detaching.  DetachCurrentThread frees all local refs on this thread,
+     * which would turn g_bootstrap_class into a dangling pointer. */
+    g_bootstrap_class = (jclass)(*g_env)->NewGlobalRef(g_env, g_bootstrap_class);
+
     g_initialized = 1;
     printf("[payload] Initialization complete!\n");
+
+    /* Detach this thread from the JVM.  We're done with JNI calls.
+     * Without this, each inject/uninject cycle leaks a JVM thread
+     * slot, eventually causing AttachCurrentThread to fail. */
+    (*g_jvm)->DetachCurrentThread(g_jvm);
+    g_env = NULL;
 
     return NULL;
 }
@@ -590,7 +692,8 @@ static void schedule_self_unload(void) {
 
     char line[512];
     while (fgets(line, sizeof(line), maps) && num_regions < 16) {
-        if (!strstr(line, "payload.so")) continue;
+        if (!strstr(line, "payload")) continue;
+        if (!strstr(line, ".so")) continue;
 
         unsigned long start, end;
         if (sscanf(line, "%lx-%lx", &start, &end) == 2) {
@@ -780,7 +883,7 @@ static void on_load(void) {
 /*
  * Exported function to trigger unload from Java
  */
-JNIEXPORT void JNICALL Java_Bootstrap_nativeUnload(JNIEnv *env, jclass cls) {
+JNIEXPORT void JNICALL Java_client_Bootstrap_nativeUnload(JNIEnv *env, jclass cls) {
     (void)env;
     (void)cls;
 

@@ -8,4 +8,15 @@ if [ -z "$PID" ]; then
     exit 1
 fi
 echo "Found Minecraft PID: $PID"
-sudo /tmp/injector "$PID" /tmp/payload.so
+
+# Copy payload.so to a unique temp file each time.
+# After unload, munmap removes the .so pages but glibc's internal link_map
+# still has an entry for the old path. dlopen with the same path just bumps
+# the refcount without calling the constructor. A unique path forces glibc
+# to treat it as a brand new library.
+rm -f /tmp/payload_inject_*.so 2>/dev/null
+UNIQUE="/tmp/payload_inject_$$.so"
+cp /tmp/payload.so "$UNIQUE"
+
+echo "Injecting $UNIQUE"
+sudo /tmp/injector "$PID" "$UNIQUE"
