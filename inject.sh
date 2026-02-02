@@ -1,17 +1,11 @@
 #!/bin/bash
-set -e
-
-cd "$(dirname "$0")"
-
-INJECTOR="build/injector.jar"
-AGENT="$(pwd)/build/agent.jar"
-
-if [ ! -f "$INJECTOR" ] || [ ! -f "$AGENT" ]; then
-    echo "[!] JARs not found. Run ./build.sh first."
+PID=$(pgrep -f 'java.*minecraft' | head -1)
+if [ -z "$PID" ]; then
+    PID=$(pgrep java | head -1)
+fi
+if [ -z "$PID" ]; then
+    echo "No Minecraft/Java process found"
     exit 1
 fi
-
-echo "[*] Injecting into Minecraft..."
-java --add-opens java.base/java.lang=ALL-UNNAMED \
-     -cp "$INJECTOR" \
-     dev.injector.Injector "$AGENT" "$@"
+echo "Found Minecraft PID: $PID"
+sudo /tmp/injector "$PID" /tmp/payload.so
