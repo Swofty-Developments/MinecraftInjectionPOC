@@ -1,5 +1,9 @@
 # Minecraft Native Injection POC
 
+![Injecting into a running Minecraft 1.8.9 client](docs/demo.gif)
+
+*One command injects the payload into a live, unmodified 1.8.9 client. The window title and action bar change, then `.` cleanly unloads it, with no JVM arguments, no agent, and no bytecode modification.*
+
 ## Background
 
 So I was recommended a YouTube video that was displaying a mod for a PVP server screensharing a player, and I thought this was odd, because surely a screenshare is not a reliable indicator? These tools claim they can detect injected cheats by checking things like JVM arguments, loaded classes, registered transformers, and heap dumps. I wanted to see if that's actually true.
