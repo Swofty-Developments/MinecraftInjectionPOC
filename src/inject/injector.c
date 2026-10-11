@@ -412,9 +412,6 @@ int inject(pid_t pid, const char *so_path) {
     unsigned long handle = remote_call(tid, dlopen_addr,
         remote_str, RTLD_NOW, 0, 0, 0, 0, scratch);
 
-    /* Don't free scratch page - remote_syscall after injection risks
-     * leaving int3 in libc code. The ~8KB leak is acceptable. */
-
     if (handle == 0 || handle == (unsigned long)-1) {
         fprintf(stderr, "dlopen failed in target process (handle=0x%lx)\n", handle);
         goto cleanup;
@@ -422,6 +419,16 @@ int inject(pid_t pid, const char *so_path) {
 
     printf("[+] Library loaded successfully! Handle: 0x%lx\n", handle);
     ret = 0;
+
+    /* The worker has finished dlopen, so the path buffer and the shellcode
+     * staging page are no longer needed - free them so injection leaves no
+     * anonymous scratch mappings behind. (The memfd exec page is unmapped
+     * later by the payload itself, during unload.) remote_syscall single-steps
+     * the thread's own parked syscall, so this writes no code into the
+     * target. */
+    remote_munmap(tid, remote_str, 4096);
+    remote_munmap(tid, scratch, 4096);
+    printf("[*] Freed injection scratch pages\n");
 
 cleanup:
 

