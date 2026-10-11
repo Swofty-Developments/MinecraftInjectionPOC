@@ -10,7 +10,7 @@ So I was recommended a YouTube video that was displaying a mod for a PVP server 
 
 Turns out, it's not. This project is a proof of concept that injects into a running Minecraft 1.8.9 client at the native level, below Java entirely, using Linux `ptrace` to load a shared library directly into the JVM process, bootstrap Java code via JNI, render on screen using Minecraft's own systems, and then fully clean up after itself, leaving essentially nothing for a screenshare tool to find.
 
-The payload is action bar text and a modified window title. Press `.` (period) and everything reverts to vanilla. The `.so` is removed from process memory via direct `munmap` shellcode.
+The payload is action bar text and a modified window title. Press `.` (period) and everything reverts to vanilla. Every page the injection mapped — the `.so`, the injection trampoline, the scratch pages, and the unload routine's own trampoline — is removed from process memory via direct `munmap` shellcode, so the maps return to exactly what a vanilla client shows.
 
 ## How it works
 
@@ -24,15 +24,13 @@ From there, a daemon tick thread runs at ~20 tps, updating the action bar and po
 
 There are no JVM arguments to find. No -javaagent, no attach API socket, nothing in /proc/<pid>/cmdline. The JVM was never told to load anything. InstrumentationImpl doesn't exist in the runtime because we never touched the Instrumentation API, so as far as the JVM is concerned, no agent has ever loaded. Running jmap -histo won't help either since the Bootstrap class lives in an isolated URLClassLoader, and on unload every reference gets nulled, the classloader is closed, and GC cleans up the rest. The class just isn't on the heap anymore.                                                                       
 
-Checking /proc/<pid>/maps for suspicious .so files comes up empty too. On unload, the payload builds x86_64 shellcode on an anonymous memory page that munmaps every region belonging to payload.so, and the .so is gone from process maps entirely. We can't use dlclose for this since glibc corrupts its own TLS state and crashes in _dl_catch_exception, so instead we just rip the pages out directly with raw syscalls. Native methods are explicitly unregistered before any of this happens, so there are no dangling function pointers and nothing pointing into unmapped memory.                                       
+Checking /proc/<pid>/maps for suspicious .so files comes up empty too. On unload, the payload builds x86_64 shellcode on an anonymous memory page that munmaps every region belonging to payload.so as well as the injector's trampoline and scratch pages, so all of it is gone from process maps. We can't use dlclose for this since glibc corrupts its own TLS state and crashes in _dl_catch_exception, so instead we just rip the pages out directly with raw syscalls. The unload page even frees itself last: it tail-jumps into libc's munmap with the return address set to a raw SYS_exit sequence in libc, so it unmaps its own page and ends its thread without ever executing from freed memory. Native methods are explicitly unregistered before any of this happens, so there are no dangling function pointers and nothing pointing into unmapped memory.                                       
 
 No bytecode is modified at any point. Rendering is done from Java code defined via JNI into an isolated classloader, and Minecraft's own classes are completely untouched, byte-for-byte identical to vanilla.  
 
 ## What's actually left after unload
 
-One thing:
-
-- A small (~4KB) `memfd:x (deleted)` mapping; this is the anonymous executable page used as a trampoline during injection. It contains no identifying information, just generic function-call shellcode. It's indistinguishable from other anonymous mappings that various libraries create.
+Nothing of ours. The unload unmaps every payload.so segment, the injector's `memfd:x` trampoline, and the injector's scratch pages, and then the self-unload routine's own trampoline page unmaps itself and exits its thread from inside libc. No payload.so, no `memfd` mapping, no stray executable page. What remains in `/proc/<pid>/maps` is exactly what a vanilla client has — JVM heap, JIT code cache, libraries, thread stacks — with nothing that points back to an injection.
 
 ## Building
 

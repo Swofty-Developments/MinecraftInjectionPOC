@@ -1,27 +1,24 @@
 /*
- * unloader.c - Utility to trigger unload of the injected payload
+ * unloader.c - Trigger an unload of an already-injected payload from outside.
  *
- * Compile: gcc -o unloader unloader.c -ldl
- * Usage:   sudo ./unloader <pid>
+ * Usage: sudo ./unloader <pid>
+ *
+ * Normally the payload unloads itself when you press the revert key in-game.
+ * This is the out-of-band path: attach, grab the payload handle via
+ * dlopen(RTLD_NOLOAD), and dlclose it. Shares remote.c with the injector.
  */
 
 #define _GNU_SOURCE
+#include "remote.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 #include <errno.h>
-#include <dlfcn.h>
 #include <sys/ptrace.h>
-#include <sys/types.h>
 #include <sys/wait.h>
 #include <sys/user.h>
 #include <sys/mman.h>
-
-#define SYS_MMAP    9
-#define SYS_MEMFD_CREATE 319
-#define SYS_WRITE   1
-#define SYS_CLOSE   3
 
 /*
  * Find library base address and path in target process
@@ -55,151 +52,6 @@ static int find_payload_info(pid_t pid, unsigned long *base, char *path, size_t 
     }
 
     fclose(fp);
-    return -1;
-}
-
-/*
- * Write memory to target process
- */
-static int write_memory(pid_t pid, unsigned long addr, const void *data, size_t len) {
-    const unsigned char *p = data;
-    size_t i = 0;
-
-    while (i < len) {
-        long word = 0;
-        size_t chunk = (len - i < sizeof(long)) ? (len - i) : sizeof(long);
-
-        if (chunk < sizeof(long)) {
-            word = ptrace(PTRACE_PEEKDATA, pid, addr + i, NULL);
-        }
-
-        memcpy(&word, p + i, chunk);
-
-        if (ptrace(PTRACE_POKEDATA, pid, addr + i, word) == -1) {
-            perror("PTRACE_POKEDATA");
-            return -1;
-        }
-        i += sizeof(long);
-    }
-    return 0;
-}
-
-/*
- * Find function address in target
- */
-static unsigned long find_remote_symbol(pid_t pid, const char *libname, const char *symbol) {
-    char maps_path[64];
-    char line[512];
-    char libpath[256] = {0};
-    unsigned long remote_base = 0;
-
-    snprintf(maps_path, sizeof(maps_path), "/proc/%d/maps", pid);
-    FILE *fp = fopen(maps_path, "r");
-    if (!fp) return 0;
-
-    /* Find the FIRST mapping (lowest address = load base) for this library */
-    while (fgets(line, sizeof(line), fp)) {
-        if (strstr(line, libname)) {
-            remote_base = strtoul(line, NULL, 16);
-            char *p = strchr(line, '/');
-            if (p) {
-                char *nl = strchr(p, '\n');
-                if (nl) *nl = '\0';
-                strncpy(libpath, p, sizeof(libpath) - 1);
-            }
-            break;
-        }
-    }
-    fclose(fp);
-
-    if (!remote_base || !libpath[0]) return 0;
-
-    /* Get symbol offset from local copy */
-    void *handle = dlopen(libpath, RTLD_NOW);
-    if (!handle) return 0;
-
-    void *sym = dlsym(handle, symbol);
-    if (!sym) {
-        dlclose(handle);
-        return 0;
-    }
-
-    Dl_info info;
-    if (!dladdr(sym, &info)) {
-        dlclose(handle);
-        return 0;
-    }
-
-    /* Verify symbol resolved from the expected library */
-    if (info.dli_fname && strstr(info.dli_fname, libpath) == NULL &&
-        strstr(libpath, info.dli_fname) == NULL) {
-        const char *info_base = strrchr(info.dli_fname, '/');
-        const char *lib_base = strrchr(libpath, '/');
-        info_base = info_base ? info_base + 1 : info.dli_fname;
-        lib_base = lib_base ? lib_base + 1 : libpath;
-        if (strstr(info_base, lib_base) == NULL && strstr(lib_base, info_base) == NULL) {
-            fprintf(stderr, "Warning: %s resolved from %s, not %s\n", symbol, info.dli_fname, libpath);
-            dlclose(handle);
-            return 0;
-        }
-    }
-
-    unsigned long offset = (unsigned long)sym - (unsigned long)info.dli_fbase;
-    dlclose(handle);
-
-    return remote_base + offset;
-}
-
-/*
- * Execute a syscall in target via PTRACE_SINGLESTEP.
- * No memory modification - reuses the existing syscall instruction at RIP-2.
- */
-static long remote_syscall(pid_t pid, long nr, long a1, long a2, long a3, long a4, long a5, long a6) {
-    struct user_regs_struct old_regs, regs;
-
-    if (ptrace(PTRACE_GETREGS, pid, NULL, &old_regs) == -1) {
-        perror("PTRACE_GETREGS");
-        return -1;
-    }
-
-    /* Verify syscall instruction at RIP-2 */
-    errno = 0;
-    long word = ptrace(PTRACE_PEEKDATA, pid, old_regs.rip - 2, NULL);
-    if (errno != 0 || (word & 0xFFFF) != 0x050F) {
-        fprintf(stderr, "[remote_syscall] no syscall at RIP-2\n");
-        return -1;
-    }
-
-    for (int attempt = 0; attempt < 100; attempt++) {
-        regs = old_regs;
-        regs.rip = old_regs.rip - 2;
-        regs.rax = nr;
-        regs.rdi = a1;
-        regs.rsi = a2;
-        regs.rdx = a3;
-        regs.r10 = a4;
-        regs.r8 = a5;
-        regs.r9 = a6;
-        regs.orig_rax = -1;
-
-        if (ptrace(PTRACE_SETREGS, pid, NULL, &regs) == -1) return -1;
-        if (ptrace(PTRACE_SINGLESTEP, pid, NULL, NULL) == -1) return -1;
-
-        int status;
-        waitpid(pid, &status, 0);
-        if (!WIFSTOPPED(status)) return -1;
-
-        int sig = WSTOPSIG(status);
-        if (sig == SIGTRAP) {
-            ptrace(PTRACE_GETREGS, pid, NULL, &regs);
-            ptrace(PTRACE_SETREGS, pid, NULL, &old_regs);
-            return regs.rax;
-        }
-
-        /* Suppress pending signal and retry */
-    }
-
-    fprintf(stderr, "[remote_syscall] too many retries\n");
     return -1;
 }
 
@@ -339,9 +191,9 @@ int main(int argc, char *argv[]) {
     waitpid(pid, &status, 0);
 
     /* Find dlopen and dlclose */
-    unsigned long dlopen_addr = find_remote_symbol(pid, "libc", "dlopen");
+    unsigned long dlopen_addr = get_remote_func(pid, "libc", "dlopen");
     if (!dlopen_addr) {
-        dlopen_addr = find_remote_symbol(pid, "libdl", "dlopen");
+        dlopen_addr = get_remote_func(pid, "libdl", "dlopen");
     }
     if (!dlopen_addr) {
         fprintf(stderr, "Could not find dlopen\n");
@@ -350,9 +202,9 @@ int main(int argc, char *argv[]) {
     }
     printf("[*] Found dlopen at 0x%lx\n", dlopen_addr);
 
-    unsigned long dlclose_addr = find_remote_symbol(pid, "libc", "dlclose");
+    unsigned long dlclose_addr = get_remote_func(pid, "libc", "dlclose");
     if (!dlclose_addr) {
-        dlclose_addr = find_remote_symbol(pid, "libdl", "dlclose");
+        dlclose_addr = get_remote_func(pid, "libdl", "dlclose");
     }
     if (!dlclose_addr) {
         fprintf(stderr, "Could not find dlclose\n");
